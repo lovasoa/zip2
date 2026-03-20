@@ -26,6 +26,51 @@ pub(crate) mod ffi {
     pub const S_IFLNK: u32 = 0o0_120_000;
 }
 
+/// Represents a ZIP file name, deduplicating storage for UTF-8 filenames.
+///
+/// For UTF-8 filenames (the common case), a single `Arc<str>` serves both
+/// the decoded name and the raw bytes. For CP437-encoded filenames, we store
+/// both the raw bytes and the decoded string separately.
+#[derive(Debug, Clone)]
+pub enum ZipFileName {
+    /// Raw bytes are valid UTF-8; one Arc serves both name() and name_raw().
+    Utf8(Arc<str>),
+    /// CP437: raw non-UTF8 bytes + decoded string.
+    Cp437 { raw: Box<[u8]>, decoded: Arc<str> },
+}
+
+impl Default for ZipFileName {
+    fn default() -> Self {
+        ZipFileName::Utf8(Arc::from(""))
+    }
+}
+
+impl ZipFileName {
+    /// Get the decoded file name as a string slice.
+    pub fn as_str(&self) -> &str {
+        match self {
+            ZipFileName::Utf8(s) => s,
+            ZipFileName::Cp437 { decoded, .. } => decoded,
+        }
+    }
+
+    /// Get the raw bytes of the file name.
+    pub fn as_raw(&self) -> &[u8] {
+        match self {
+            ZipFileName::Utf8(s) => s.as_bytes(),
+            ZipFileName::Cp437 { raw, .. } => raw,
+        }
+    }
+
+    /// Get a reference to the inner `Arc<str>` for cheap cloning (e.g. for IndexMap keys).
+    pub(crate) fn arc_str(&self) -> &Arc<str> {
+        match self {
+            ZipFileName::Utf8(s) => s,
+            ZipFileName::Cp437 { decoded, .. } => decoded,
+        }
+    }
+}
+
 pub(crate) struct ZipRawValues {
     pub(crate) crc32: u32,
     pub(crate) compressed_size: u64,
@@ -189,10 +234,8 @@ pub struct ZipFileData {
     pub compressed_size: u64,
     /// Size of the file when extracted
     pub uncompressed_size: u64,
-    /// Name of the file
-    pub file_name: Box<str>,
-    /// Raw file name. To be used when `file_name` was incorrectly decoded.
-    pub file_name_raw: Box<[u8]>,
+    /// Name of the file (decoded and raw combined)
+    pub file_name: ZipFileName,
     /// Extra field usually used for storage expansion
     pub extra_field: Option<Arc<[u8]>>,
     /// Extra field only written to central directory
@@ -264,13 +307,14 @@ impl ZipFileData {
 
     #[allow(dead_code)]
     pub fn is_dir(&self) -> bool {
-        is_dir(&self.file_name)
+        is_dir(self.file_name.as_str())
     }
 
     pub fn file_name_sanitized(&self) -> PathBuf {
-        let no_null_filename = match self.file_name.find('\0') {
-            Some(index) => &self.file_name[0..index],
-            None => &self.file_name,
+        let name = self.file_name.as_str();
+        let no_null_filename = match name.find('\0') {
+            Some(index) => &name[0..index],
+            None => name,
         };
 
         file_name_sanitized(no_null_filename)
@@ -278,18 +322,20 @@ impl ZipFileData {
 
     /// Simplify the file name by removing the prefix and parent directories and only return normal components
     pub(crate) fn simplified_components(&self) -> Option<Vec<&OsStr>> {
-        if self.file_name.contains('\0') {
+        let name = self.file_name.as_str();
+        if name.contains('\0') {
             return None;
         }
-        let input = Path::new(OsStr::new(&*self.file_name));
+        let input = Path::new(OsStr::new(name));
         crate::path::simplified_components(input)
     }
 
     pub(crate) fn enclosed_name(&self) -> Option<PathBuf> {
-        if self.file_name.contains('\0') {
+        let name = self.file_name.as_str();
+        if name.contains('\0') {
             return None;
         }
-        enclosed_name(&self.file_name)
+        enclosed_name(name)
     }
 
     /// Get unix mode for the file
@@ -395,8 +441,7 @@ impl ZipFileData {
         let permissions = options
             .permissions
             .unwrap_or(FileOptions::DEFAULT_FILE_PERMISSION);
-        let file_name: Box<str> = name.to_string().into_boxed_str();
-        let file_name_raw: Box<[u8]> = file_name.as_bytes().into();
+        let file_name = ZipFileName::Utf8(Arc::from(name.to_string().as_str()));
         let mut external_attributes = permissions << 16;
         let system = if (permissions & ffi::S_IFLNK) == ffi::S_IFLNK {
             System::Unix
@@ -409,7 +454,7 @@ impl ZipFileData {
             System::Unix
         };
         if system == System::Dos {
-            if is_dir(&file_name) {
+            if is_dir(file_name.as_str()) {
                 // DOS directory bit
                 external_attributes |= 0x10;
             }
@@ -430,7 +475,7 @@ impl ZipFileData {
             flags: 0,
             encrypted,
             using_data_descriptor: false,
-            is_utf8: !file_name.is_ascii(),
+            is_utf8: !file_name.as_raw().is_ascii(),
             compression_method,
             compression_level: options.compression_level,
             last_modified_time: Some(options.last_modified_time),
@@ -438,7 +483,6 @@ impl ZipFileData {
             compressed_size: raw_values.compressed_size,
             uncompressed_size: raw_values.uncompressed_size,
             file_name, // Never used for saving, but used as map key in insert_file_data()
-            file_name_raw,
             extra_field: Some(Arc::from(extra_field)),
             central_extra_field: options
                 .extended_options
@@ -513,13 +557,20 @@ impl ZipFileData {
             return Err(e.into());
         }
 
-        let file_name: Box<str> = if is_utf8 {
-            String::from_utf8_lossy(&file_name_raw).into()
+        let file_name = if is_utf8 {
+            match std::str::from_utf8(&file_name_raw) {
+                Ok(s) => ZipFileName::Utf8(Arc::from(s)),
+                Err(_) => {
+                    let decoded: Arc<str> = Arc::from(String::from_utf8_lossy(&file_name_raw).as_ref());
+                    ZipFileName::Cp437 { raw: file_name_raw.into(), decoded }
+                }
+            }
         } else {
-            file_name_raw
-                .from_cp437()
-                .map_err(std::io::Error::other)?
-                .into()
+            use std::borrow::Cow;
+            match file_name_raw.from_cp437().map_err(std::io::Error::other)? {
+                Cow::Borrowed(s) => ZipFileName::Utf8(Arc::from(s)),
+                Cow::Owned(s) => ZipFileName::Cp437 { raw: file_name_raw.into(), decoded: Arc::from(s.as_str()) },
+            }
         };
 
         let (version_made_by, system) = System::extract_bytes(version_made_by);
@@ -537,7 +588,6 @@ impl ZipFileData {
             compressed_size: compressed_size.into(),
             uncompressed_size: uncompressed_size.into(),
             file_name,
-            file_name_raw: file_name_raw.into(),
             extra_field: Some(Arc::from(extra_field.into_boxed_slice())),
             central_extra_field: None,
             file_comment: String::with_capacity(0).into_boxed_str(), // file comment is only available in the central directory
@@ -559,11 +609,11 @@ impl ZipFileData {
     }
 
     fn is_utf8(&self) -> bool {
-        std::str::from_utf8(&self.file_name_raw).is_ok()
+        std::str::from_utf8(self.file_name.as_raw()).is_ok()
     }
 
     fn is_ascii(&self) -> bool {
-        self.file_name_raw.is_ascii() && self.file_comment.is_ascii()
+        self.file_name.as_raw().is_ascii() && self.file_comment.is_ascii()
     }
 
     fn flags(&self) -> u16 {
@@ -623,7 +673,8 @@ impl ZipFileData {
             compressed_size,
             uncompressed_size,
             file_name_length: self
-                .file_name_raw
+                .file_name
+                .as_raw()
                 .len()
                 .try_into()
                 .map_err(std::io::Error::other)?,
@@ -678,7 +729,8 @@ impl ZipFileData {
             compressed_size,
             uncompressed_size,
             file_name_length: self
-                .file_name_raw
+                .file_name
+                .as_raw()
                 .len()
                 .try_into()
                 .map_err(std::io::Error::other)?,
@@ -835,6 +887,8 @@ mod tests {
         use super::{System, ZipFileData};
         use std::{path::PathBuf, sync::OnceLock};
 
+        use super::ZipFileName;
+        use std::sync::Arc;
         let file_name = "/path/../../../../etc/./passwd\0/etc/shadow".to_string();
         let data = ZipFileData {
             system: System::Dos,
@@ -849,8 +903,7 @@ mod tests {
             crc32: 0,
             compressed_size: 0,
             uncompressed_size: 0,
-            file_name: file_name.clone().into_boxed_str(),
-            file_name_raw: file_name.into_bytes().into_boxed_slice(),
+            file_name: ZipFileName::Utf8(Arc::from(file_name.as_str())),
             extra_field: None,
             central_extra_field: None,
             file_comment: String::with_capacity(0).into_boxed_str(),

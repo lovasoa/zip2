@@ -14,6 +14,7 @@ use indexmap::IndexMap;
 use std::borrow::Cow;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Stream decoder for zip.
 #[derive(Debug)]
@@ -64,7 +65,7 @@ impl<R: Read> ZipStreamReader<R> {
     /// Extraction is not atomic; If an error is encountered, some of the files
     /// may be left on disk.
     pub fn extract<P: AsRef<Path>>(self, directory: P) -> ZipResult<()> {
-        struct Extractor(PathBuf, IndexMap<Box<str>, ()>);
+        struct Extractor(PathBuf, IndexMap<Arc<str>, ()>);
         impl ZipStreamVisitor for Extractor {
             fn visit_file<R: Read>(&mut self, file: &mut ZipFile<'_, R>) -> ZipResult<()> {
                 self.1.insert(file.name().into(), ());
@@ -152,14 +153,14 @@ impl ZipStreamFileMetadata {
     /// You can use the [`ZipFile::enclosed_name`] method to validate the name
     /// as a safe path.
     pub fn name(&self) -> &str {
-        &self.0.file_name
+        self.0.file_name.as_str()
     }
 
     /// Get the name of the file, in the raw (internal) byte representation.
     ///
     /// The encoding of this data is currently undefined.
     pub fn name_raw(&self) -> &[u8] {
-        &self.0.file_name_raw
+        self.0.file_name.as_raw()
     }
 
     /// Rewrite the path, ignoring any path components with special meaning.

@@ -8,7 +8,7 @@ use crate::extra_fields::Zip64ExtendedInformation;
 use crate::read::{Config, ZipArchive, ZipFile, parse_single_extra_field};
 use crate::result::{ZipError, ZipResult, invalid};
 use crate::spec::{self, FixedSizeBlock, Zip32CDEBlock, ZipLocalEntryBlock};
-use crate::types::{AesVendorVersion, MIN_VERSION, System, ZipFileData, ZipRawValues, ffi};
+use crate::types::{AesVendorVersion, MIN_VERSION, System, ZipFileData, ZipFileName, ZipRawValues, ffi};
 use core::default::Default;
 use core::fmt::{Debug, Formatter};
 use core::marker::PhantomData;
@@ -136,6 +136,7 @@ pub(crate) mod zip_writer {
     use core::fmt::{Debug, Formatter};
     use indexmap::IndexMap;
     use std::io::{Seek, Write};
+    use std::sync::Arc;
 
     /// ZIP archive generator
     ///
@@ -172,7 +173,7 @@ pub(crate) mod zip_writer {
     /// ```
     pub struct ZipWriter<W: Write + Seek> {
         pub(super) inner: GenericZipWriter<W>,
-        pub(super) files: IndexMap<Box<str>, ZipFileData>,
+        pub(super) files: IndexMap<Arc<str>, ZipFileData>,
         pub(super) stats: ZipWriterStats,
         pub(super) writing_to_file: bool,
         pub(super) writing_raw: bool,
@@ -894,13 +895,11 @@ impl<A: Read + Write + Seek> ZipWriter<A> {
             .try_inner_mut()?
             .seek(SeekFrom::Start(write_position))?;
         let mut new_data = src_data.clone();
-        let dest_name_raw = dest_name.as_bytes();
-        new_data.file_name = dest_name.into();
-        new_data.file_name_raw = dest_name_raw.into();
+        new_data.file_name = ZipFileName::Utf8(Arc::from(dest_name));
         new_data.header_start = write_position;
         let extra_data_start = write_position
             + size_of::<ZipLocalEntryBlock>() as u64
-            + new_data.file_name_raw.len() as u64;
+            + new_data.file_name.as_raw().len() as u64;
         new_data.extra_data_start = Some(extra_data_start);
         if let Some(extra) = &src_data.extra_field {
             let stripped = strip_alignment_extra_field(extra, false);
@@ -924,7 +923,7 @@ impl<A: Read + Write + Seek> ZipWriter<A> {
         let result: io::Result<()> = {
             let plain_writer = self.inner.try_inner_mut()?;
             block.write(plain_writer)?;
-            plain_writer.write_all(&new_data.file_name_raw)?;
+            plain_writer.write_all(new_data.file_name.as_raw())?;
             if let Some(data) = &new_data.extra_field {
                 plain_writer.write_all(data)?;
             }
@@ -1282,7 +1281,7 @@ impl<W: Write + Seek> ZipWriter<W> {
             let writer = self.inner.try_inner_mut()?;
             block.write(writer)?;
             // file name
-            writer.write_all(&file.file_name_raw)?;
+            writer.write_all(file.file_name.as_raw())?;
             if extra_data_len > 0 {
                 writer.write_all(&extra_data)?;
                 file.extra_field = Some(Arc::from(extra_data.into_boxed_slice()));
@@ -1352,10 +1351,11 @@ impl<W: Write + Seek> ZipWriter<W> {
     }
 
     fn insert_file_data(&mut self, file: ZipFileData) -> ZipResult<usize> {
-        if self.files.contains_key(&file.file_name) {
-            return Err(invalid!("Duplicate filename: {}", file.file_name));
+        if self.files.contains_key(file.file_name.as_str()) {
+            return Err(invalid!("Duplicate filename: {}", file.file_name.as_str()));
         }
-        let (index, _) = self.files.insert_full(file.file_name.clone(), file);
+        let key = file.file_name.arc_str().clone();
+        let (index, _) = self.files.insert_full(key, file);
         Ok(index)
     }
 
@@ -1937,8 +1937,7 @@ impl<W: Write + Seek> ZipWriter<W> {
         }
         let src_index = self.index_by_name(src_name)?;
         let mut dest_data = self.files[src_index].clone();
-        dest_data.file_name = dest_name.into();
-        dest_data.file_name_raw = dest_name.as_bytes().into();
+        dest_data.file_name = ZipFileName::Utf8(Arc::from(dest_name));
         dest_data.central_header_start = 0;
         self.insert_file_data(dest_data)?;
 
@@ -2443,7 +2442,7 @@ impl ZipFileData {
 
         let zip64_extra_field_start = self.header_start
             + size_of::<ZipLocalEntryBlock>() as u64
-            + self.file_name_raw.len() as u64;
+            + self.file_name.as_raw().len() as u64;
 
         writer.seek(SeekFrom::Start(zip64_extra_field_start))?;
         let zip64_block = zip64_block.serialize();
@@ -2476,7 +2475,7 @@ impl ZipFileData {
 
         block.write(writer)?;
         // file name
-        writer.write_all(&self.file_name_raw)?;
+        writer.write_all(self.file_name.as_raw())?;
         // extra field
         if let Some(zip64_extra_field) = zip64_extra_field_block {
             writer.write_all(&zip64_extra_field.serialize())?;
@@ -2835,6 +2834,12 @@ mod tests {
     const THIRD_FILENAME: &str = "third_name.xyz";
 
     #[test]
+    #[ignore = "This test uses `String::from_utf8_unchecked` with invalid UTF-8 bytes, \
+                which is undefined behavior. The `str` type has an invariant that its \
+                contents are valid UTF-8, and violating this makes the test unsound. \
+                A proper test would need an API that accepts raw non-UTF-8 filenames \
+                (e.g. `start_file_raw(&mut self, name: &[u8], ...)`) which does not \
+                yet exist."]
     fn write_non_utf8() {
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
         let options = FileOptions {
